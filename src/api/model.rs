@@ -66,6 +66,59 @@ pub(super) struct SummaryData {
 }
 
 #[derive(Serialize)]
+pub(super) struct MeWritersSummary {
+    pub(super) configured_dc_groups: usize,
+    pub(super) configured_endpoints: usize,
+    pub(super) available_endpoints: usize,
+    pub(super) available_pct: f64,
+    pub(super) required_writers: usize,
+    pub(super) alive_writers: usize,
+    pub(super) coverage_pct: f64,
+}
+
+#[derive(Serialize)]
+pub(super) struct MeWriterStatus {
+    pub(super) writer_id: u64,
+    pub(super) dc: Option<i16>,
+    pub(super) endpoint: String,
+    pub(super) generation: u64,
+    pub(super) state: &'static str,
+    pub(super) draining: bool,
+    pub(super) degraded: bool,
+    pub(super) bound_clients: usize,
+    pub(super) idle_for_secs: Option<u64>,
+    pub(super) rtt_ema_ms: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub(super) struct MeWritersData {
+    pub(super) middle_proxy_enabled: bool,
+    pub(super) generated_at_epoch_secs: u64,
+    pub(super) summary: MeWritersSummary,
+    pub(super) writers: Vec<MeWriterStatus>,
+}
+
+#[derive(Serialize)]
+pub(super) struct DcStatus {
+    pub(super) dc: i16,
+    pub(super) endpoints: Vec<String>,
+    pub(super) available_endpoints: usize,
+    pub(super) available_pct: f64,
+    pub(super) required_writers: usize,
+    pub(super) alive_writers: usize,
+    pub(super) coverage_pct: f64,
+    pub(super) rtt_ms: Option<f64>,
+    pub(super) load: usize,
+}
+
+#[derive(Serialize)]
+pub(super) struct DcStatusData {
+    pub(super) middle_proxy_enabled: bool,
+    pub(super) generated_at_epoch_secs: u64,
+    pub(super) dcs: Vec<DcStatus>,
+}
+
+#[derive(Serialize)]
 pub(super) struct UserInfo {
     pub(super) username: String,
     pub(super) user_ad_tag: Option<String>,

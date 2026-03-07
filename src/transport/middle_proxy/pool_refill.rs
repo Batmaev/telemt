@@ -218,14 +218,6 @@ impl MePool {
         false
     }
 
-    pub(crate) fn trigger_immediate_refill(self: &Arc<Self>, addr: SocketAddr) {
-        let pool = Arc::clone(self);
-        tokio::spawn(async move {
-            let writer_dc = pool.resolve_dc_for_endpoint(addr).await;
-            pool.trigger_immediate_refill_for_dc(addr, writer_dc);
-        });
-    }
-
     pub(crate) fn trigger_immediate_refill_for_dc(self: &Arc<Self>, addr: SocketAddr, writer_dc: i32) {
         let endpoint_key = RefillEndpointKey {
             dc: writer_dc,
@@ -243,7 +235,6 @@ impl MePool {
 
         let pool = Arc::clone(self);
         tokio::spawn(async move {
-            let dc_endpoints = pool.endpoints_for_dc(writer_dc).await;
             let dc_key = RefillDcKey {
                 dc: writer_dc,
                 family: if addr.is_ipv4() {

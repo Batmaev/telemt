@@ -819,18 +819,6 @@ impl MePool {
         (self.default_dc_for_routing(), true)
     }
 
-    pub(super) fn dc_lookup_chain_for_target(&self, target_dc: i32) -> Vec<i32> {
-        let mut out = Vec::with_capacity(1);
-        if target_dc != 0 {
-            out.push(target_dc);
-        } else {
-            // Use default DC only when target DC is unknown and pinning is not established.
-            let fallback_dc = self.default_dc_for_routing();
-            out.push(fallback_dc);
-        }
-        out
-    }
-
     pub(super) async fn resolve_dc_for_endpoint(&self, addr: SocketAddr) -> i32 {
         if let Some(cached) = self.endpoint_dc_map.read().await.get(&addr).copied()
             && let Some(dc) = cached

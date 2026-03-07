@@ -50,11 +50,6 @@ impl MePool {
         }
     }
 
-    pub(crate) async fn connect_one(self: &Arc<Self>, addr: SocketAddr, rng: &SecureRandom) -> Result<()> {
-        let writer_dc = self.resolve_dc_for_endpoint(addr).await;
-        self.connect_one_for_dc(addr, writer_dc, rng).await
-    }
-
     pub(crate) async fn connect_one_for_dc(
         self: &Arc<Self>,
         addr: SocketAddr,

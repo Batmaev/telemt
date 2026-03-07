@@ -124,6 +124,7 @@ pub struct MePool {
     pub(super) me_adaptive_floor_target_writers_total: AtomicU64,
     pub(super) proxy_map_v4: Arc<RwLock<HashMap<i32, Vec<(IpAddr, u16)>>>>,
     pub(super) proxy_map_v6: Arc<RwLock<HashMap<i32, Vec<(IpAddr, u16)>>>>,
+    pub(super) endpoint_dc_map: Arc<RwLock<HashMap<SocketAddr, Option<i32>>>>,
     pub(super) default_dc: AtomicI32,
     pub(super) next_writer_id: AtomicU64,
     pub(super) ping_tracker: Arc<Mutex<HashMap<i64, (std::time::Instant, u64)>>>,
@@ -254,6 +255,7 @@ impl MePool {
         me_route_inline_recovery_attempts: u32,
         me_route_inline_recovery_wait_ms: u64,
     ) -> Arc<Self> {
+        let endpoint_dc_map = Self::build_endpoint_dc_map_from_maps(&proxy_map_v4, &proxy_map_v6);
         let registry = Arc::new(ConnRegistry::new());
         registry.update_route_backpressure_policy(
             me_route_backpressure_base_timeout_ms,
@@ -355,6 +357,7 @@ impl MePool {
             pool_size: 2,
             proxy_map_v4: Arc::new(RwLock::new(proxy_map_v4)),
             proxy_map_v6: Arc::new(RwLock::new(proxy_map_v6)),
+            endpoint_dc_map: Arc::new(RwLock::new(endpoint_dc_map)),
             default_dc: AtomicI32::new(default_dc.unwrap_or(2)),
             next_writer_id: AtomicU64::new(1),
             ping_tracker: Arc::new(Mutex::new(HashMap::new())),
@@ -789,33 +792,8 @@ impl MePool {
     }
 
     pub(super) async fn resolve_dc_for_endpoint(&self, addr: SocketAddr) -> i32 {
-        let map_guard = if addr.is_ipv4() {
-            self.proxy_map_v4.read().await
-        } else {
-            self.proxy_map_v6.read().await
-        };
-
-        let mut matched_dc: Option<i32> = None;
-        let mut ambiguous = false;
-        for (dc, addrs) in map_guard.iter() {
-            if addrs
-                .iter()
-                .any(|(ip, port)| SocketAddr::new(*ip, *port) == addr)
-            {
-                match matched_dc {
-                    None => matched_dc = Some(*dc),
-                    Some(prev_dc) if prev_dc == *dc => {}
-                    Some(_) => {
-                        ambiguous = true;
-                        break;
-                    }
-                }
-            }
-        }
-        drop(map_guard);
-
-        if !ambiguous
-            && let Some(dc) = matched_dc
+        if let Some(cached) = self.endpoint_dc_map.read().await.get(&addr).copied()
+            && let Some(dc) = cached
         {
             return dc;
         }
@@ -831,5 +809,49 @@ impl MePool {
             IpFamily::V4 => self.proxy_map_v4.read().await.clone(),
             IpFamily::V6 => self.proxy_map_v6.read().await.clone(),
         }
+    }
+
+    fn merge_endpoint_dc(
+        endpoint_dc_map: &mut HashMap<SocketAddr, Option<i32>>,
+        dc: i32,
+        ip: IpAddr,
+        port: u16,
+    ) {
+        let endpoint = SocketAddr::new(ip, port);
+        match endpoint_dc_map.get_mut(&endpoint) {
+            None => {
+                endpoint_dc_map.insert(endpoint, Some(dc));
+            }
+            Some(existing) => {
+                if existing.is_some_and(|existing_dc| existing_dc != dc) {
+                    *existing = None;
+                }
+            }
+        }
+    }
+
+    fn build_endpoint_dc_map_from_maps(
+        map_v4: &HashMap<i32, Vec<(IpAddr, u16)>>,
+        map_v6: &HashMap<i32, Vec<(IpAddr, u16)>>,
+    ) -> HashMap<SocketAddr, Option<i32>> {
+        let mut endpoint_dc_map = HashMap::<SocketAddr, Option<i32>>::new();
+        for (dc, endpoints) in map_v4 {
+            for (ip, port) in endpoints {
+                Self::merge_endpoint_dc(&mut endpoint_dc_map, *dc, *ip, *port);
+            }
+        }
+        for (dc, endpoints) in map_v6 {
+            for (ip, port) in endpoints {
+                Self::merge_endpoint_dc(&mut endpoint_dc_map, *dc, *ip, *port);
+            }
+        }
+        endpoint_dc_map
+    }
+
+    pub(super) async fn rebuild_endpoint_dc_map(&self) {
+        let map_v4 = self.proxy_map_v4.read().await.clone();
+        let map_v6 = self.proxy_map_v6.read().await.clone();
+        let rebuilt = Self::build_endpoint_dc_map_from_maps(&map_v4, &map_v6);
+        *self.endpoint_dc_map.write().await = rebuilt;
     }
 }

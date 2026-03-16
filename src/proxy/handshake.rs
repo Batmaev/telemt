@@ -27,7 +27,11 @@ const ACCESS_SECRET_BYTES: usize = 16;
 static INVALID_SECRET_WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
 
 const AUTH_PROBE_TRACK_RETENTION_SECS: u64 = 10 * 60;
+#[cfg(test)]
+const AUTH_PROBE_TRACK_MAX_ENTRIES: usize = 256;
+#[cfg(not(test))]
 const AUTH_PROBE_TRACK_MAX_ENTRIES: usize = 65_536;
+const AUTH_PROBE_PRUNE_SCAN_LIMIT: usize = 1_024;
 const AUTH_PROBE_BACKOFF_START_FAILS: u32 = 4;
 
 #[cfg(test)]
@@ -85,6 +89,14 @@ fn auth_probe_is_throttled(peer_ip: IpAddr, now: Instant) -> bool {
 
 fn auth_probe_record_failure(peer_ip: IpAddr, now: Instant) {
     let state = auth_probe_state_map();
+    auth_probe_record_failure_with_state(state, peer_ip, now);
+}
+
+fn auth_probe_record_failure_with_state(
+    state: &DashMap<IpAddr, AuthProbeState>,
+    peer_ip: IpAddr,
+    now: Instant,
+) {
     if let Some(mut entry) = state.get_mut(&peer_ip) {
         if auth_probe_state_expired(&entry, now) {
             *entry = AuthProbeState {
@@ -101,7 +113,18 @@ fn auth_probe_record_failure(peer_ip: IpAddr, now: Instant) {
     };
 
     if state.len() >= AUTH_PROBE_TRACK_MAX_ENTRIES {
-        return;
+        let mut stale_keys = Vec::new();
+        for entry in state.iter().take(AUTH_PROBE_PRUNE_SCAN_LIMIT) {
+            if auth_probe_state_expired(entry.value(), now) {
+                stale_keys.push(*entry.key());
+            }
+        }
+        for stale_key in stale_keys {
+            state.remove(&stale_key);
+        }
+        if state.len() >= AUTH_PROBE_TRACK_MAX_ENTRIES {
+            return;
+        }
     }
 
     state.insert(peer_ip, AuthProbeState {

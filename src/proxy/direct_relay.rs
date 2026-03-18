@@ -132,7 +132,11 @@ fn open_unknown_dc_log_append(path: &Path) -> std::io::Result<std::fs::File> {
     }
     #[cfg(not(unix))]
     {
-        OpenOptions::new().create(true).append(true).open(path)
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unknown_dc_file_log_enabled requires unix O_NOFOLLOW support",
+        ))
     }
 }
 
@@ -204,6 +208,7 @@ where
         config.general.direct_relay_copy_buf_s2c_bytes,
         user,
         Arc::clone(&stats),
+        config.access.user_data_quota.get(user).copied(),
         buffer_pool,
     );
     tokio::pin!(relay_result);

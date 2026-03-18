@@ -103,7 +103,7 @@ pub fn build_emulated_server_hello(
     cached: &CachedTlsData,
     use_full_cert_payload: bool,
     rng: &SecureRandom,
-    _alpn: Option<Vec<u8>>,
+    alpn: Option<Vec<u8>>,
     new_session_tickets: u8,
 ) -> Vec<u8> {
     // --- ServerHello ---
@@ -198,8 +198,22 @@ pub fn build_emulated_server_hello(
     }
 
     let mut app_data = Vec::new();
+    let alpn_marker = alpn
+        .as_ref()
+        .filter(|p| !p.is_empty() && p.len() <= u8::MAX as usize)
+        .map(|proto| {
+            let proto_list_len = 1usize + proto.len();
+            let ext_data_len = 2usize + proto_list_len;
+            let mut marker = Vec::with_capacity(4 + ext_data_len);
+            marker.extend_from_slice(&0x0010u16.to_be_bytes());
+            marker.extend_from_slice(&(ext_data_len as u16).to_be_bytes());
+            marker.extend_from_slice(&(proto_list_len as u16).to_be_bytes());
+            marker.push(proto.len() as u8);
+            marker.extend_from_slice(proto);
+            marker
+        });
     let mut payload_offset = 0usize;
-    for size in sizes {
+    for (idx, size) in sizes.into_iter().enumerate() {
         let mut rec = Vec::with_capacity(5 + size);
         rec.push(TLS_RECORD_APPLICATION);
         rec.extend_from_slice(&TLS_VERSION);
@@ -224,7 +238,20 @@ pub fn build_emulated_server_hello(
             }
         } else if size > 17 {
             let body_len = size - 17;
-            rec.extend_from_slice(&rng.bytes(body_len));
+            let mut body = Vec::with_capacity(body_len);
+            if idx == 0 && let Some(marker) = &alpn_marker {
+                if marker.len() <= body_len {
+                    body.extend_from_slice(marker);
+                    if body_len > marker.len() {
+                        body.extend_from_slice(&rng.bytes(body_len - marker.len()));
+                    }
+                } else {
+                    body.extend_from_slice(&rng.bytes(body_len));
+                }
+            } else {
+                body.extend_from_slice(&rng.bytes(body_len));
+            }
+            rec.extend_from_slice(&body);
             rec.push(0x16); // inner content type marker (handshake)
             rec.extend_from_slice(&rng.bytes(16)); // AEAD-like tag
         } else {
@@ -236,8 +263,9 @@ pub fn build_emulated_server_hello(
     // --- Combine ---
     // Optional NewSessionTicket mimic records (opaque ApplicationData for fingerprint).
     let mut tickets = Vec::new();
-    if new_session_tickets > 0 {
-        for _ in 0..new_session_tickets {
+    let ticket_count = new_session_tickets.min(4);
+    if ticket_count > 0 {
+        for _ in 0..ticket_count {
             let ticket_len: usize = rng.range(48) + 48;
             let mut rec = Vec::with_capacity(5 + ticket_len);
             rec.push(TLS_RECORD_APPLICATION);
@@ -263,6 +291,10 @@ pub fn build_emulated_server_hello(
 
     response
 }
+
+#[cfg(test)]
+#[path = "emulator_security_tests.rs"]
+mod security_tests;
 
 #[cfg(test)]
 mod tests {

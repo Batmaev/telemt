@@ -1585,6 +1585,47 @@ fn stress_auth_probe_full_map_churn_keeps_bound_and_tracks_newcomers() {
 }
 
 #[test]
+fn auth_probe_over_cap_churn_still_tracks_newcomer_after_round_limit() {
+    let _guard = auth_probe_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_auth_probe_state_for_testing();
+
+    let state = DashMap::new();
+    let now = Instant::now();
+    let initial = AUTH_PROBE_TRACK_MAX_ENTRIES + 32;
+
+    for idx in 0..initial {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            10,
+            6,
+            ((idx >> 8) & 0xff) as u8,
+            (idx & 0xff) as u8,
+        ));
+        state.insert(
+            ip,
+            AuthProbeState {
+                fail_streak: 1,
+                blocked_until: now,
+                last_seen: now + Duration::from_millis((idx % 1024) as u64),
+            },
+        );
+    }
+
+    let newcomer = IpAddr::V4(Ipv4Addr::new(203, 0, 114, 77));
+    auth_probe_record_failure_with_state(&state, newcomer, now + Duration::from_secs(1));
+
+    assert!(
+        state.get(&newcomer).is_some(),
+        "new probe source must still be tracked even when map starts above hard cap"
+    );
+    assert!(
+        state.len() < initial + 1,
+        "round-limited eviction path must still reclaim capacity under over-cap churn"
+    );
+}
+
+#[test]
 fn auth_probe_capacity_prefers_evicting_low_fail_streak_entries_first() {
     let _guard = auth_probe_test_lock()
         .lock()

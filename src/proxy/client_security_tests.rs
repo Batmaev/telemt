@@ -43,6 +43,35 @@ where
 }
 
 #[tokio::test]
+async fn user_connection_reservation_drop_enqueues_cleanup_synchronously() {
+    let ip_tracker = Arc::new(crate::ip_tracker::UserIpTracker::new());
+    let stats = Arc::new(crate::stats::Stats::new());
+    let user = "sync-drop-user".to_string();
+    let ip: std::net::IpAddr = "192.168.1.1".parse().unwrap();
+    
+    ip_tracker.set_user_limit(&user, 1).await;
+    ip_tracker.check_and_add(&user, ip).await.unwrap();
+    stats.increment_user_curr_connects(&user);
+    
+    assert_eq!(ip_tracker.get_active_ip_count(&user).await, 1);
+    assert_eq!(stats.get_user_curr_connects(&user), 1);
+    
+    let reservation = UserConnectionReservation::new(stats.clone(), ip_tracker.clone(), user.clone(), ip);
+    
+    // Drop the reservation synchronously without any tokio::spawn/await yielding!
+    drop(reservation);
+    
+    // The IP is now inside the cleanup_queue, check that the queue has length 1
+    let queue_len = ip_tracker.cleanup_queue.lock().unwrap().len();
+    assert_eq!(queue_len, 1, "Reservation drop must push directly to synchronized IP queue");
+    
+    assert_eq!(stats.get_user_curr_connects(&user), 0, "Stats must decrement immediately");
+    
+    ip_tracker.drain_cleanup_queue().await;
+    assert_eq!(ip_tracker.get_active_ip_count(&user).await, 0);
+}
+
+#[tokio::test]
 async fn relay_task_abort_releases_user_gate_and_ip_reservation() {
     let tg_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tg_addr = tg_listener.local_addr().unwrap();

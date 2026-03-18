@@ -13,8 +13,9 @@ use rand::{Rng, SeedableRng};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use tokio::io::AsyncWriteExt;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::thread;
+use tokio::io::AsyncReadExt;
 use tokio::io::duplex;
 use tokio::time::{Duration as TokioDuration, timeout};
 
@@ -176,6 +177,36 @@ async fn enqueue_c2me_command_full_then_closed_recycles_waiting_payload() {
     );
 }
 
+#[tokio::test]
+async fn enqueue_c2me_command_full_queue_times_out_without_receiver_progress() {
+    let (tx, _rx) = mpsc::channel::<C2MeCommand>(1);
+    tx.send(C2MeCommand::Data {
+        payload: make_pooled_payload(&[1]),
+        flags: 0,
+    })
+    .await
+    .unwrap();
+
+    let started = Instant::now();
+    let result = enqueue_c2me_command(
+        &tx,
+        C2MeCommand::Data {
+            payload: make_pooled_payload(&[2, 2]),
+            flags: 1,
+        },
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "enqueue must fail when queue stays full beyond bounded timeout"
+    );
+    assert!(
+        started.elapsed() < TokioDuration::from_millis(400),
+        "full-queue timeout must resolve promptly"
+    );
+}
+
 #[test]
 fn desync_dedup_cache_is_bounded() {
     let _guard = desync_dedup_test_lock()
@@ -192,12 +223,12 @@ fn desync_dedup_cache_is_bounded() {
     }
 
     assert!(
-        !should_emit_full_desync(u64::MAX, false, now),
-        "new key above cap must remain suppressed to avoid log amplification"
+        should_emit_full_desync(u64::MAX, false, now),
+        "new key above cap must emit once after bounded eviction for forensic visibility"
     );
 
     assert!(
-        !should_emit_full_desync(7, false, now),
+        !should_emit_full_desync(u64::MAX, false, now),
         "already tracked key inside dedup window must stay suppressed"
     );
 }
@@ -215,10 +246,18 @@ fn desync_dedup_full_cache_churn_stays_suppressed() {
     }
 
     for offset in 0..2048u64 {
-        assert!(
-            !should_emit_full_desync(u64::MAX - offset, false, now),
-            "fresh full-cache churn must remain suppressed under pressure"
-        );
+        let emitted = should_emit_full_desync(u64::MAX - offset, false, now);
+        if offset == 0 {
+            assert!(
+                emitted,
+                "first full-cache newcomer should emit for forensic visibility"
+            );
+        } else {
+            assert!(
+                !emitted,
+                "full-cache newcomer churn inside emit interval must stay suppressed"
+            );
+        }
     }
 }
 
@@ -296,17 +335,19 @@ fn stress_desync_dedup_churn_keeps_cache_hard_bounded() {
     let now = Instant::now();
     let total = DESYNC_DEDUP_MAX_ENTRIES + 8192;
 
+    let mut emitted_count = 0usize;
     for key in 0..total as u64 {
         let emitted = should_emit_full_desync(key, false, now);
-        if key < DESYNC_DEDUP_MAX_ENTRIES as u64 {
-            assert!(emitted, "keys below cap must be admitted initially");
-        } else {
-            assert!(
-                !emitted,
-                "new keys above cap must stay suppressed under sustained churn"
-            );
+        if emitted {
+            emitted_count += 1;
         }
     }
+
+    assert_eq!(
+        emitted_count,
+        DESYNC_DEDUP_MAX_ENTRIES + 1,
+        "after capacity is reached, same-tick newcomer churn must be rate-limited"
+    );
 
     let len = DESYNC_DEDUP
         .get()
@@ -316,6 +357,282 @@ fn stress_desync_dedup_churn_keeps_cache_hard_bounded() {
         len <= DESYNC_DEDUP_MAX_ENTRIES,
         "dedup cache must stay bounded under stress churn"
     );
+}
+
+#[test]
+fn full_cache_newcomer_emission_is_rate_limited_but_periodic() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("desync dedup test lock must be available");
+    clear_desync_dedup_for_testing();
+
+    let dedup = DESYNC_DEDUP.get_or_init(DashMap::new);
+    let base_now = Instant::now();
+
+    for key in 0..DESYNC_DEDUP_MAX_ENTRIES as u64 {
+        dedup.insert(key, base_now - TokioDuration::from_millis(10));
+    }
+
+    // Same-tick newcomer storm: only the first should emit full forensic record.
+    let mut burst_emits = 0usize;
+    for i in 0..1024u64 {
+        if should_emit_full_desync(10_000_000 + i, false, base_now) {
+            burst_emits += 1;
+        }
+    }
+    assert_eq!(
+        burst_emits, 1,
+        "full-cache newcomer burst must be bounded to a single full emit per interval"
+    );
+
+    // After each interval elapses, one newcomer may emit again.
+    for step in 1..=6u64 {
+        let t = base_now + DESYNC_FULL_CACHE_EMIT_MIN_INTERVAL * step as u32;
+        assert!(
+            should_emit_full_desync(20_000_000 + step, false, t),
+            "full-cache newcomer should re-emit once interval has elapsed"
+        );
+        assert!(
+            !should_emit_full_desync(30_000_000 + step, false, t),
+            "additional newcomers in the same interval tick must remain suppressed"
+        );
+    }
+}
+
+#[test]
+fn full_cache_mode_override_emits_every_event() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("desync dedup test lock must be available");
+    clear_desync_dedup_for_testing();
+
+    let now = Instant::now();
+    for i in 0..10_000u64 {
+        assert!(
+            should_emit_full_desync(100_000_000 + i, true, now),
+            "desync_all_full override must bypass dedup and rate-limit suppression"
+        );
+    }
+}
+
+#[test]
+fn report_desync_stats_follow_rate_limited_full_cache_policy() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("desync dedup test lock must be available");
+    clear_desync_dedup_for_testing();
+
+    let dedup = DESYNC_DEDUP.get_or_init(DashMap::new);
+    let base_now = Instant::now();
+    for key in 0..DESYNC_DEDUP_MAX_ENTRIES as u64 {
+        dedup.insert(key, base_now - TokioDuration::from_millis(10));
+    }
+
+    let stats = Stats::new();
+    let mut state = make_forensics_state();
+    state.started_at = base_now;
+
+    for i in 0..128u64 {
+        state.peer_hash = 0xABC0_0000_0000_0000u64 ^ i;
+        let _ = report_desync_frame_too_large(
+            &state,
+            ProtoTag::Secure,
+            3,
+            1024,
+            4096,
+            Some([0x16, 0x03, 0x03, 0x00]),
+            &stats,
+        );
+    }
+
+    assert_eq!(
+        stats.get_desync_total(),
+        128,
+        "every detected desync must increment total counter"
+    );
+    assert_eq!(
+        stats.get_desync_full_logged(),
+        1,
+        "same-interval full-cache newcomer storm must allow only one full forensic emit"
+    );
+    assert_eq!(
+        stats.get_desync_suppressed(),
+        127,
+        "remaining same-interval full-cache newcomer events must be suppressed"
+    );
+
+    // After one full interval in real wall clock, a newcomer should emit again.
+    thread::sleep(DESYNC_FULL_CACHE_EMIT_MIN_INTERVAL + TokioDuration::from_millis(20));
+    state.peer_hash = 0xDEAD_BEEF_DEAD_BEEFu64;
+    let _ = report_desync_frame_too_large(
+        &state,
+        ProtoTag::Secure,
+        4,
+        1024,
+        4097,
+        Some([0x16, 0x03, 0x03, 0x01]),
+        &stats,
+    );
+
+    assert_eq!(
+        stats.get_desync_full_logged(),
+        2,
+        "full forensic emission must recover after rate-limit interval"
+    );
+}
+
+#[test]
+fn concurrent_full_cache_newcomer_storm_is_single_emit_per_interval() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("desync dedup test lock must be available");
+    clear_desync_dedup_for_testing();
+
+    let dedup = DESYNC_DEDUP.get_or_init(DashMap::new);
+    let base_now = Instant::now();
+    for key in 0..DESYNC_DEDUP_MAX_ENTRIES as u64 {
+        dedup.insert(key, base_now - TokioDuration::from_millis(10));
+    }
+
+    let emits = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+    for worker_id in 0..32u64 {
+        let emits = Arc::clone(&emits);
+        workers.push(thread::spawn(move || {
+            for i in 0..512u64 {
+                let key = 0x7000_0000_0000_0000u64 ^ (worker_id << 20) ^ i;
+                if should_emit_full_desync(key, false, base_now) {
+                    emits.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+
+    for worker in workers {
+        worker.join().expect("worker thread must not panic");
+    }
+
+    assert_eq!(
+        emits.load(Ordering::Relaxed),
+        1,
+        "concurrent same-interval full-cache storm must allow only one full forensic emit"
+    );
+}
+
+#[test]
+fn light_fuzz_full_cache_rate_limit_oracle_matches_model() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("desync dedup test lock must be available");
+    clear_desync_dedup_for_testing();
+
+    let dedup = DESYNC_DEDUP.get_or_init(DashMap::new);
+    let base_now = Instant::now();
+    for key in 0..DESYNC_DEDUP_MAX_ENTRIES as u64 {
+        dedup.insert(key, base_now - TokioDuration::from_millis(10));
+    }
+
+    let mut rng = StdRng::seed_from_u64(0xD15EA5E5_F00DBAAD);
+    let mut model_last_emit: Option<Instant> = None;
+
+    for i in 0..4096u64 {
+        let jitter_ms: u64 = rng.random_range(0..=3000);
+        let t = base_now + TokioDuration::from_millis(jitter_ms);
+        let key = 0x55AA_0000_0000_0000u64 ^ i ^ rng.random::<u64>();
+        let actual = should_emit_full_desync(key, false, t);
+
+        let expected = match model_last_emit {
+            None => {
+                model_last_emit = Some(t);
+                true
+            }
+            Some(last) => {
+                match t.checked_duration_since(last) {
+                    Some(elapsed) if elapsed >= DESYNC_FULL_CACHE_EMIT_MIN_INTERVAL => {
+                        model_last_emit = Some(t);
+                        true
+                    }
+                    Some(_) => false,
+                    None => {
+                        // Match production fail-open behavior for non-monotonic synthetic input.
+                        model_last_emit = Some(t);
+                        true
+                    }
+                }
+            }
+        };
+
+        assert_eq!(
+            actual, expected,
+            "full-cache rate-limit gate diverged from reference model under light fuzz"
+        );
+    }
+}
+
+#[test]
+fn full_cache_gate_lock_poison_is_fail_closed_without_panic() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("desync dedup test lock must be available");
+    clear_desync_dedup_for_testing();
+
+    let dedup = DESYNC_DEDUP.get_or_init(DashMap::new);
+    let base_now = Instant::now();
+    for key in 0..DESYNC_DEDUP_MAX_ENTRIES as u64 {
+        dedup.insert(key, base_now - TokioDuration::from_millis(10));
+    }
+
+    // Poison the full-cache gate lock intentionally.
+    let gate = DESYNC_FULL_CACHE_LAST_EMIT_AT.get_or_init(|| Mutex::new(None));
+    let _ = std::panic::catch_unwind(|| {
+        let _lock = gate.lock().expect("gate lock must be lockable before poison");
+        panic!("intentional gate poison for fail-closed regression");
+    });
+
+    let emitted = should_emit_full_desync(0xFACE_0000_0000_0001, false, base_now);
+    assert!(
+        !emitted,
+        "poisoned full-cache gate must fail-closed (suppress) instead of panic or fail-open"
+    );
+    assert!(
+        dedup.len() <= DESYNC_DEDUP_MAX_ENTRIES,
+        "dedup cache must remain bounded even when gate lock is poisoned"
+    );
+}
+
+#[test]
+fn full_cache_non_monotonic_time_emits_and_resets_gate_safely() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("desync dedup test lock must be available");
+    clear_desync_dedup_for_testing();
+
+    let dedup = DESYNC_DEDUP.get_or_init(DashMap::new);
+    let base_now = Instant::now();
+    for key in 0..DESYNC_DEDUP_MAX_ENTRIES as u64 {
+        dedup.insert(key, base_now - TokioDuration::from_millis(10));
+    }
+
+    // First event seeds the gate.
+    assert!(should_emit_full_desync(
+        0xABCD_0000_0000_0001,
+        false,
+        base_now + TokioDuration::from_millis(900)
+    ));
+
+    // Synthetic earlier timestamp must not panic; it should fail-open and reset gate.
+    assert!(should_emit_full_desync(
+        0xABCD_0000_0000_0002,
+        false,
+        base_now + TokioDuration::from_millis(100)
+    ));
+
+    // Same instant again remains suppressed after reset.
+    assert!(!should_emit_full_desync(
+        0xABCD_0000_0000_0003,
+        false,
+        base_now + TokioDuration::from_millis(100)
+    ));
 }
 
 #[test]
@@ -338,8 +655,8 @@ fn desync_dedup_full_cache_inserts_new_key_with_bounded_single_key_churn() {
     let newcomer_key = u64::MAX;
     let emitted = should_emit_full_desync(newcomer_key, false, base_now);
     assert!(
-        !emitted,
-        "new entry under full fresh cache must stay suppressed"
+        emitted,
+        "new entry under full fresh cache must emit after bounded eviction"
     );
     assert!(
         dedup.get(&newcomer_key).is_some(),
@@ -404,6 +721,24 @@ fn light_fuzz_desync_dedup_temporal_gate_behavior_is_stable() {
     }
 
     panic!("expected at least one post-window sample to re-emit forensic record");
+}
+
+#[test]
+#[ignore = "Tracking for M-04: Verify should_emit_full_desync returns true on first occurrence and false on duplicate within window"]
+fn should_emit_full_desync_filters_duplicates() {
+    unimplemented!("Stub for M-04");
+}
+
+#[test]
+#[ignore = "Tracking for M-04: Verify desync dedup eviction behaves correctly under map-full condition"]
+fn desync_dedup_eviction_under_map_full_condition() {
+    unimplemented!("Stub for M-04");
+}
+
+#[tokio::test]
+#[ignore = "Tracking for M-05: Verify C2ME channel full path yields then sends under backpressure"]
+async fn c2me_channel_full_path_yields_then_sends() {
+    unimplemented!("Stub for M-05");
 }
 
 fn make_forensics_state() -> RelayForensicsState {
@@ -974,6 +1309,7 @@ async fn process_me_writer_response_ack_obeys_flush_policy() {
         &mut frame_buf,
         &stats,
         "user",
+        None,
         &bytes_me2c,
         77,
         true,
@@ -999,6 +1335,7 @@ async fn process_me_writer_response_ack_obeys_flush_policy() {
         &mut frame_buf,
         &stats,
         "user",
+        None,
         &bytes_me2c,
         77,
         false,
@@ -1038,6 +1375,7 @@ async fn process_me_writer_response_data_updates_byte_accounting() {
         &mut frame_buf,
         &stats,
         "user",
+        None,
         &bytes_me2c,
         88,
         false,
@@ -1058,6 +1396,162 @@ async fn process_me_writer_response_data_updates_byte_accounting() {
         bytes_me2c.load(std::sync::atomic::Ordering::Relaxed),
         payload.len() as u64,
         "ME->C byte accounting must increase by emitted payload size"
+    );
+}
+
+#[tokio::test]
+async fn process_me_writer_response_data_enforces_live_user_quota() {
+    let (writer_side, mut reader_side) = duplex(1024);
+    let mut writer = make_crypto_writer(writer_side);
+    let rng = SecureRandom::new();
+    let mut frame_buf = Vec::new();
+    let stats = Stats::new();
+    let bytes_me2c = AtomicU64::new(0);
+
+    stats.add_user_octets_from("quota-user", 10);
+
+    let result = process_me_writer_response(
+        MeResponse::Data {
+            flags: 0,
+            data: Bytes::from(vec![1u8, 2, 3, 4]),
+        },
+        &mut writer,
+        ProtoTag::Intermediate,
+        &rng,
+        &mut frame_buf,
+        &stats,
+        "quota-user",
+        Some(12),
+        &bytes_me2c,
+        89,
+        false,
+        false,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(ProxyError::DataQuotaExceeded { user }) if user == "quota-user"),
+        "ME->client runtime path must terminate when live user quota is crossed"
+    );
+
+    let mut raw = [0u8; 1];
+    assert!(
+        timeout(TokioDuration::from_millis(100), reader_side.read(&mut raw))
+            .await
+            .is_err(),
+        "quota exhaustion must not write any ciphertext to the client stream"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn process_me_writer_response_concurrent_same_user_quota_does_not_overshoot_limit() {
+    let stats = Stats::new();
+    let bytes_me2c = AtomicU64::new(0);
+    let user = "quota-race-user";
+
+    let (writer_side_a, _reader_side_a) = duplex(1024);
+    let (writer_side_b, _reader_side_b) = duplex(1024);
+    let mut writer_a = make_crypto_writer(writer_side_a);
+    let mut writer_b = make_crypto_writer(writer_side_b);
+    let mut frame_buf_a = Vec::new();
+    let mut frame_buf_b = Vec::new();
+    let rng_a = SecureRandom::new();
+    let rng_b = SecureRandom::new();
+
+    let fut_a = process_me_writer_response(
+        MeResponse::Data {
+            flags: 0,
+            data: Bytes::from_static(&[0x11]),
+        },
+        &mut writer_a,
+        ProtoTag::Intermediate,
+        &rng_a,
+        &mut frame_buf_a,
+        &stats,
+        user,
+        Some(1),
+        &bytes_me2c,
+        91,
+        false,
+        false,
+    );
+    let fut_b = process_me_writer_response(
+        MeResponse::Data {
+            flags: 0,
+            data: Bytes::from_static(&[0x22]),
+        },
+        &mut writer_b,
+        ProtoTag::Intermediate,
+        &rng_b,
+        &mut frame_buf_b,
+        &stats,
+        user,
+        Some(1),
+        &bytes_me2c,
+        92,
+        false,
+        false,
+    );
+
+    let (result_a, result_b) = tokio::join!(fut_a, fut_b);
+
+    assert!(
+        matches!(result_a, Err(ProxyError::DataQuotaExceeded { ref user }) if user == "quota-race-user")
+            || matches!(result_a, Ok(_)),
+        "concurrent quota test must complete without panicking"
+    );
+    assert!(
+        matches!(result_b, Err(ProxyError::DataQuotaExceeded { ref user }) if user == "quota-race-user")
+            || matches!(result_b, Ok(_)),
+        "concurrent quota test must complete without panicking"
+    );
+    assert!(
+        stats.get_user_total_octets(user) <= 1,
+        "same-user concurrent middle-relay responses must not overshoot the configured quota"
+    );
+}
+
+#[tokio::test]
+async fn process_me_writer_response_data_does_not_forward_partial_payload_when_remaining_quota_is_smaller_than_message() {
+    let (writer_side, mut reader_side) = duplex(1024);
+    let mut writer = make_crypto_writer(writer_side);
+    let rng = SecureRandom::new();
+    let mut frame_buf = Vec::new();
+    let stats = Stats::new();
+    let bytes_me2c = AtomicU64::new(0);
+
+    stats.add_user_octets_to("partial-quota-user", 3);
+
+    let result = process_me_writer_response(
+        MeResponse::Data {
+            flags: 0,
+            data: Bytes::from(vec![1u8, 2, 3, 4]),
+        },
+        &mut writer,
+        ProtoTag::Intermediate,
+        &rng,
+        &mut frame_buf,
+        &stats,
+        "partial-quota-user",
+        Some(4),
+        &bytes_me2c,
+        90,
+        false,
+        false,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(ProxyError::DataQuotaExceeded { user }) if user == "partial-quota-user"),
+        "ME->client runtime path must reject oversized payloads before writing"
+    );
+
+    let mut raw = [0u8; 1];
+    assert!(
+        timeout(TokioDuration::from_millis(100), reader_side.read(&mut raw))
+            .await
+            .is_err(),
+        "oversized payloads must not leak any partial ciphertext to the client stream"
     );
 }
 

@@ -34,6 +34,9 @@ pub const TIME_SKEW_MIN: i64 = -2 * 60; // 2 minutes before
 pub const TIME_SKEW_MAX: i64 = 2 * 60;  // 2 minutes after
 /// Maximum accepted boot-time timestamp (seconds) before skew checks are enforced.
 pub const BOOT_TIME_MAX_SECS: u32 = 7 * 24 * 60 * 60;
+/// Hard cap for boot-time compatibility bypass to avoid oversized acceptance
+/// windows when replay TTL is configured very large.
+pub const BOOT_TIME_COMPAT_MAX_SECS: u32 = 2 * 60;
 
 // ============= Private Constants =============
 
@@ -66,6 +69,7 @@ pub struct TlsValidation {
     /// Client digest for response generation
     pub digest: [u8; TLS_DIGEST_LEN],
     /// Timestamp extracted from digest
+    
     pub timestamp: u32,
 }
 
@@ -121,6 +125,7 @@ impl TlsExtensionBuilder {
     }
 
     /// Build final extensions with length prefix
+    
     fn build(self) -> Vec<u8> {
         let mut result = Vec::with_capacity(2 + self.extensions.len());
         
@@ -135,7 +140,7 @@ impl TlsExtensionBuilder {
     }
     
     /// Get current extensions without length prefix (for calculation)
-    #[allow(dead_code)]
+    
     fn as_bytes(&self) -> &[u8] {
         &self.extensions
     }
@@ -251,6 +256,7 @@ impl ServerHelloBuilder {
 /// Returns validation result if a matching user is found.
 /// The result **must** be used — ignoring it silently bypasses authentication.
 #[must_use]
+
 pub fn validate_tls_handshake(
     handshake: &[u8],
     secrets: &[(String, Vec<u8>)],
@@ -266,9 +272,9 @@ pub fn validate_tls_handshake(
 
 /// Validate TLS ClientHello and cap the boot-time bypass by replay-cache TTL.
 ///
-/// A boot-time timestamp is only accepted when it falls below both
-/// `BOOT_TIME_MAX_SECS` and the configured replay window, preventing timestamp
-/// reuse outside replay cache coverage.
+/// A boot-time timestamp is only accepted when it falls below all three
+/// bounds: `BOOT_TIME_MAX_SECS`, configured replay window, and
+/// `BOOT_TIME_COMPAT_MAX_SECS`, preventing oversized compatibility windows.
 #[must_use]
 pub fn validate_tls_handshake_with_replay_window(
     handshake: &[u8],
@@ -292,7 +298,9 @@ pub fn validate_tls_handshake_with_replay_window(
     let boot_time_cap_secs = if ignore_time_skew {
         0
     } else {
-        BOOT_TIME_MAX_SECS.min(replay_window_u32)
+        BOOT_TIME_MAX_SECS
+            .min(replay_window_u32)
+            .min(BOOT_TIME_COMPAT_MAX_SECS)
     };
 
     validate_tls_handshake_at_time_with_boot_cap(
@@ -311,6 +319,7 @@ fn system_time_to_unix_secs(now: SystemTime) -> Option<i64> {
     let d = now.duration_since(UNIX_EPOCH).ok()?;
     i64::try_from(d.as_secs()).ok()
 }
+
 
 fn validate_tls_handshake_at_time(
     handshake: &[u8],
@@ -437,7 +446,7 @@ pub fn build_server_hello(
     session_id: &[u8],
     fake_cert_len: usize,
     rng: &SecureRandom,
-    _alpn: Option<Vec<u8>>,
+    alpn: Option<Vec<u8>>,
     new_session_tickets: u8,
 ) -> Vec<u8> {
     const MIN_APP_DATA: usize = 64;
@@ -459,8 +468,27 @@ pub fn build_server_hello(
         0x01,       // CCS byte
     ];
     
-    // Build fake certificate (Application Data record)
-    let fake_cert = rng.bytes(fake_cert_len);
+    // Build first encrypted flight mimic as opaque ApplicationData bytes.
+    // Embed a compact EncryptedExtensions-like ALPN block when selected.
+    let mut fake_cert = Vec::with_capacity(fake_cert_len);
+    if let Some(proto) = alpn.as_ref().filter(|p| !p.is_empty() && p.len() <= u8::MAX as usize) {
+        let proto_list_len = 1usize + proto.len();
+        let ext_data_len = 2usize + proto_list_len;
+        let marker_len = 4usize + ext_data_len;
+        if marker_len <= fake_cert_len {
+            fake_cert.extend_from_slice(&0x0010u16.to_be_bytes());
+            fake_cert.extend_from_slice(&(ext_data_len as u16).to_be_bytes());
+            fake_cert.extend_from_slice(&(proto_list_len as u16).to_be_bytes());
+            fake_cert.push(proto.len() as u8);
+            fake_cert.extend_from_slice(proto);
+        }
+    }
+    if fake_cert.len() < fake_cert_len {
+        fake_cert.extend_from_slice(&rng.bytes(fake_cert_len - fake_cert.len()));
+    } else if fake_cert.len() > fake_cert_len {
+        fake_cert.truncate(fake_cert_len);
+    }
+
     let mut app_data_record = Vec::with_capacity(5 + fake_cert_len);
     app_data_record.push(TLS_RECORD_APPLICATION);
     app_data_record.extend_from_slice(&TLS_VERSION);
@@ -472,8 +500,9 @@ pub fn build_server_hello(
     // Build optional NewSessionTicket records (TLS 1.3 handshake messages are encrypted;
     // here we mimic with opaque ApplicationData records of plausible size).
     let mut tickets = Vec::new();
-    if new_session_tickets > 0 {
-        for _ in 0..new_session_tickets {
+    let ticket_count = new_session_tickets.min(4);
+    if ticket_count > 0 {
+        for _ in 0..ticket_count {
             let ticket_len: usize = rng.range(48) + 48; // 48-95 bytes
             let mut record = Vec::with_capacity(5 + ticket_len);
             record.push(TLS_RECORD_APPLICATION);
@@ -678,6 +707,7 @@ pub fn is_tls_handshake(first_bytes: &[u8]) -> bool {
 }
 
 /// Parse TLS record header, returns (record_type, length)
+
 pub fn parse_tls_record_header(header: &[u8; 5]) -> Option<(u8, u16)> {
     let record_type = header[0];
     let version = [header[1], header[2]];

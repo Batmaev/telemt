@@ -454,6 +454,7 @@ impl ConnRegistry {
         true
     }
 
+    #[allow(dead_code)]
     pub(super) async fn non_empty_writer_ids(&self, writer_ids: &[u64]) -> HashSet<u64> {
         let inner = self.inner.read().await;
         let mut out = HashSet::<u64>::with_capacity(writer_ids.len());

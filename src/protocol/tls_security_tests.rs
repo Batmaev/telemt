@@ -300,8 +300,8 @@ fn boot_time_timestamp_accepted_without_ignore_flag() {
     // Timestamps below the boot-time threshold are treated as client uptime,
     // not real wall-clock time.  The proxy allows them regardless of skew.
     let secret = b"boot_time_test";
-    // Keep this safely below BOOT_TIME_MAX_SECS to assert bypass behavior.
-    let boot_ts: u32 = BOOT_TIME_MAX_SECS / 2;
+    // Keep this safely below compatibility cap to assert bypass behavior.
+    let boot_ts: u32 = BOOT_TIME_COMPAT_MAX_SECS.saturating_sub(1);
     let handshake = make_valid_tls_handshake(secret, boot_ts);
     let secrets = vec![("u".to_string(), secret.to_vec())];
     assert!(
@@ -663,13 +663,14 @@ fn zero_length_session_id_accepted() {
 // Boot-time threshold — exact boundary precision
 // ------------------------------------------------------------------
 
-/// timestamp = BOOT_TIME_MAX_SECS - 1 is the last value inside the boot-time window.
+/// timestamp = BOOT_TIME_COMPAT_MAX_SECS - 1 is the last value inside
+/// the runtime boot-time compatibility window.
 /// is_boot_time = true → skew check is skipped entirely → accepted even
 /// when `now` is far from the timestamp.
 #[test]
 fn timestamp_one_below_boot_threshold_bypasses_skew_check() {
     let secret = b"boot_last_value_test";
-    let ts: u32 = BOOT_TIME_MAX_SECS - 1;
+    let ts: u32 = BOOT_TIME_COMPAT_MAX_SECS - 1;
     let h = make_valid_tls_handshake(secret, ts);
     let secrets = vec![("u".to_string(), secret.to_vec())];
 
@@ -677,32 +678,48 @@ fn timestamp_one_below_boot_threshold_bypasses_skew_check() {
     // Boot-time bypass must prevent the skew check from running.
     assert!(
         validate_tls_handshake_at_time(&h, &secrets, false, 0).is_some(),
-        "ts=BOOT_TIME_MAX_SECS-1 must bypass skew check regardless of now"
+        "ts=BOOT_TIME_COMPAT_MAX_SECS-1 must bypass skew check regardless of now"
     );
 }
 
-/// timestamp = BOOT_TIME_MAX_SECS is the first value outside the boot-time window.
+/// timestamp = BOOT_TIME_COMPAT_MAX_SECS is the first value outside the
+/// runtime boot-time compatibility window.
 /// is_boot_time = false → skew check IS applied.  Two sub-cases confirm this:
 /// once with now chosen so the skew passes (accepted) and once where it fails.
 #[test]
 fn timestamp_at_boot_threshold_triggers_skew_check() {
     let secret = b"boot_exact_value_test";
-    let ts: u32 = BOOT_TIME_MAX_SECS;
+    let ts: u32 = BOOT_TIME_COMPAT_MAX_SECS;
     let h = make_valid_tls_handshake(secret, ts);
     let secrets = vec![("u".to_string(), secret.to_vec())];
 
     // now = ts + 50 → time_diff = 50, within [-1200, 600] → accepted.
     let now_valid: i64 = ts as i64 + 50;
     assert!(
-        validate_tls_handshake_at_time(&h, &secrets, false, now_valid).is_some(),
-        "ts=BOOT_TIME_MAX_SECS within skew window must be accepted via skew check"
+        validate_tls_handshake_at_time_with_boot_cap(
+            &h,
+            &secrets,
+            false,
+            now_valid,
+            BOOT_TIME_COMPAT_MAX_SECS,
+        )
+        .is_some(),
+        "ts=BOOT_TIME_COMPAT_MAX_SECS within skew window must be accepted via skew check"
     );
 
-    // now = 0 → time_diff = -86_400_000, outside window → rejected.
-    // If the boot-time bypass were wrongly applied here this would pass.
+    // now = -1 → time_diff = -121 at the 120-second threshold, outside window
+    // for TIME_SKEW_MIN=-120. If boot-time bypass were wrongly applied this
+    // would pass.
     assert!(
-        validate_tls_handshake_at_time(&h, &secrets, false, 0).is_none(),
-        "ts=BOOT_TIME_MAX_SECS far from now must be rejected — no boot-time bypass"
+        validate_tls_handshake_at_time_with_boot_cap(
+            &h,
+            &secrets,
+            false,
+            -1,
+            BOOT_TIME_COMPAT_MAX_SECS,
+        )
+        .is_none(),
+        "ts=BOOT_TIME_COMPAT_MAX_SECS far from now must be rejected — no boot-time bypass"
     );
 }
 
@@ -723,7 +740,7 @@ fn replay_window_cap_disables_boot_bypass_for_old_timestamps() {
 #[test]
 fn replay_window_cap_still_allows_small_boot_timestamp() {
     let secret = b"boot_cap_enabled_test";
-    let ts: u32 = 120;
+    let ts: u32 = BOOT_TIME_COMPAT_MAX_SECS.saturating_sub(1);
     let h = make_valid_tls_handshake(secret, ts);
     let secrets = vec![("u".to_string(), secret.to_vec())];
 
@@ -731,6 +748,20 @@ fn replay_window_cap_still_allows_small_boot_timestamp() {
     assert!(
         result.is_some(),
         "timestamp below replay-window cap must retain boot-time compatibility"
+    );
+}
+
+#[test]
+fn large_replay_window_is_hard_capped_for_boot_compatibility() {
+    let secret = b"boot_cap_hard_limit_test";
+    let ts: u32 = BOOT_TIME_COMPAT_MAX_SECS + 1;
+    let h = make_valid_tls_handshake(secret, ts);
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+
+    let result = validate_tls_handshake_with_replay_window(&h, &secrets, false, u64::MAX);
+    assert!(
+        result.is_none(),
+        "very large replay window must not expand boot-time bypass beyond hard compatibility cap"
     );
 }
 
@@ -743,7 +774,7 @@ fn ignore_time_skew_explicitly_decouples_from_boot_time_cap() {
 
     let cap_zero = validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, true, 0, 0);
     let cap_nonzero =
-        validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, true, 0, BOOT_TIME_MAX_SECS);
+        validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, true, 0, BOOT_TIME_COMPAT_MAX_SECS);
 
     assert!(cap_zero.is_some(), "ignore_time_skew=true must accept valid HMAC");
     assert!(
@@ -1886,6 +1917,228 @@ fn server_hello_new_session_ticket_count_matches_configuration() {
         app_records,
         1 + tickets as usize,
         "response must contain one main application record plus configured ticket-like tail records"
+    );
+}
+
+#[test]
+fn server_hello_new_session_ticket_count_is_safely_capped() {
+    let secret = b"ticket_count_cap_test";
+    let client_digest = [0x44u8; TLS_DIGEST_LEN];
+    let session_id = vec![0x54; 32];
+    let rng = crate::crypto::SecureRandom::new();
+
+    let response = build_server_hello(secret, &client_digest, &session_id, 1024, &rng, None, u8::MAX);
+
+    let mut pos = 0usize;
+    let mut app_records = 0usize;
+    while pos + 5 <= response.len() {
+        let rtype = response[pos];
+        let rlen = u16::from_be_bytes([response[pos + 3], response[pos + 4]]) as usize;
+        let next = pos + 5 + rlen;
+        assert!(next <= response.len(), "TLS record must stay inside response bounds");
+        if rtype == TLS_RECORD_APPLICATION {
+            app_records += 1;
+        }
+        pos = next;
+    }
+
+    assert_eq!(
+        app_records,
+        5,
+        "response must cap ticket-like tail records to four plus one main application record"
+    );
+}
+
+#[test]
+fn server_hello_application_data_contains_alpn_marker_when_selected() {
+    let secret = b"alpn_marker_test";
+    let client_digest = [0x55u8; TLS_DIGEST_LEN];
+    let session_id = vec![0xAB; 32];
+    let rng = crate::crypto::SecureRandom::new();
+
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        512,
+        &rng,
+        Some(b"h2".to_vec()),
+        0,
+    );
+
+    let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
+    let ccs_pos = 5 + sh_len;
+    let ccs_len = u16::from_be_bytes([response[ccs_pos + 3], response[ccs_pos + 4]]) as usize;
+    let app_pos = ccs_pos + 5 + ccs_len;
+    let app_len = u16::from_be_bytes([response[app_pos + 3], response[app_pos + 4]]) as usize;
+    let app_payload = &response[app_pos + 5..app_pos + 5 + app_len];
+
+    let expected = [0x00u8, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, b'h', b'2'];
+    assert!(
+        app_payload.windows(expected.len()).any(|window| window == expected),
+        "first application payload must carry ALPN marker for selected protocol"
+    );
+}
+
+#[test]
+fn server_hello_ignores_oversized_alpn_and_still_caps_ticket_tail() {
+    let secret = b"alpn_oversize_ignore_test";
+    let client_digest = [0x56u8; TLS_DIGEST_LEN];
+    let session_id = vec![0xCD; 32];
+    let rng = crate::crypto::SecureRandom::new();
+    let oversized_alpn = vec![b'x'; u8::MAX as usize + 1];
+
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        512,
+        &rng,
+        Some(oversized_alpn),
+        u8::MAX,
+    );
+
+    let mut pos = 0usize;
+    let mut app_records = 0usize;
+    let mut first_app_payload: Option<&[u8]> = None;
+    while pos + 5 <= response.len() {
+        let rtype = response[pos];
+        let rlen = u16::from_be_bytes([response[pos + 3], response[pos + 4]]) as usize;
+        let next = pos + 5 + rlen;
+        assert!(next <= response.len(), "TLS record must stay inside response bounds");
+        if rtype == TLS_RECORD_APPLICATION {
+            app_records += 1;
+            if first_app_payload.is_none() {
+                first_app_payload = Some(&response[pos + 5..next]);
+            }
+        }
+        pos = next;
+    }
+    let marker = [0x00u8, 0x10, 0x00, 0x06, 0x00, 0x04, 0x03, b'x', b'x', b'x', b'x'];
+
+    assert_eq!(
+        app_records, 5,
+        "oversized ALPN must not change the four-ticket cap on tail records"
+    );
+    assert!(
+        !first_app_payload
+            .expect("response must contain an application record")
+            .windows(marker.len())
+            .any(|window| window == marker),
+        "oversized ALPN must be ignored rather than embedded into the first application payload"
+    );
+}
+
+#[test]
+fn server_hello_ignores_oversized_alpn_when_marker_would_not_fit() {
+    let secret = b"alpn_too_large_to_fit_test";
+    let client_digest = [0x57u8; TLS_DIGEST_LEN];
+    let session_id = vec![0xEF; 32];
+    let rng = crate::crypto::SecureRandom::new();
+    let oversized_alpn = vec![0xAB; u8::MAX as usize];
+
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        64,
+        &rng,
+        Some(oversized_alpn),
+        0,
+    );
+
+    let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
+    let ccs_pos = 5 + sh_len;
+    let ccs_len = u16::from_be_bytes([response[ccs_pos + 3], response[ccs_pos + 4]]) as usize;
+    let app_pos = ccs_pos + 5 + ccs_len;
+    let app_len = u16::from_be_bytes([response[app_pos + 3], response[app_pos + 4]]) as usize;
+    let app_payload = &response[app_pos + 5..app_pos + 5 + app_len];
+
+    let mut marker_prefix = Vec::new();
+    marker_prefix.extend_from_slice(&0x0010u16.to_be_bytes());
+    marker_prefix.extend_from_slice(&0x0102u16.to_be_bytes());
+    marker_prefix.extend_from_slice(&0x0100u16.to_be_bytes());
+    marker_prefix.push(0xff);
+    marker_prefix.extend_from_slice(&[0xab; 8]);
+    assert!(
+        !app_payload.starts_with(&marker_prefix),
+        "oversized ALPN must not be partially embedded into the ServerHello application record"
+    );
+}
+
+#[test]
+fn server_hello_embeds_full_alpn_marker_when_it_exactly_fits_fake_cert_len() {
+    let secret = b"alpn_exact_fit_test";
+    let client_digest = [0x58u8; TLS_DIGEST_LEN];
+    let session_id = vec![0xA5; 32];
+    let rng = crate::crypto::SecureRandom::new();
+    let proto = vec![b'z'; 57];
+
+    // marker_len = 4 + (2 + (1 + proto_len)) = 7 + proto_len = 64
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        64,
+        &rng,
+        Some(proto.clone()),
+        0,
+    );
+
+    let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
+    let ccs_pos = 5 + sh_len;
+    let ccs_len = u16::from_be_bytes([response[ccs_pos + 3], response[ccs_pos + 4]]) as usize;
+    let app_pos = ccs_pos + 5 + ccs_len;
+    let app_len = u16::from_be_bytes([response[app_pos + 3], response[app_pos + 4]]) as usize;
+    let app_payload = &response[app_pos + 5..app_pos + 5 + app_len];
+
+    let mut expected_marker = Vec::new();
+    expected_marker.extend_from_slice(&0x0010u16.to_be_bytes());
+    expected_marker.extend_from_slice(&0x003Cu16.to_be_bytes());
+    expected_marker.extend_from_slice(&0x003Au16.to_be_bytes());
+    expected_marker.push(57u8);
+    expected_marker.extend_from_slice(&proto);
+
+    assert_eq!(app_payload.len(), expected_marker.len());
+    assert_eq!(app_payload, expected_marker.as_slice());
+}
+
+#[test]
+fn server_hello_does_not_embed_partial_alpn_marker_when_one_byte_short() {
+    let secret = b"alpn_one_byte_short_test";
+    let client_digest = [0x59u8; TLS_DIGEST_LEN];
+    let session_id = vec![0xA6; 32];
+    let rng = crate::crypto::SecureRandom::new();
+    let proto = vec![0xAB; 58];
+
+    // marker_len = 65, fake_cert_len = 64 => marker must be fully skipped.
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        64,
+        &rng,
+        Some(proto),
+        0,
+    );
+
+    let sh_len = u16::from_be_bytes([response[3], response[4]]) as usize;
+    let ccs_pos = 5 + sh_len;
+    let ccs_len = u16::from_be_bytes([response[ccs_pos + 3], response[ccs_pos + 4]]) as usize;
+    let app_pos = ccs_pos + 5 + ccs_len;
+    let app_len = u16::from_be_bytes([response[app_pos + 3], response[app_pos + 4]]) as usize;
+    let app_payload = &response[app_pos + 5..app_pos + 5 + app_len];
+
+    let mut marker_prefix = Vec::new();
+    marker_prefix.extend_from_slice(&0x0010u16.to_be_bytes());
+    marker_prefix.extend_from_slice(&0x003Du16.to_be_bytes());
+    marker_prefix.extend_from_slice(&0x003Bu16.to_be_bytes());
+    marker_prefix.push(58u8);
+    marker_prefix.extend_from_slice(&[0xAB; 8]);
+
+    assert!(
+        !app_payload.starts_with(&marker_prefix),
+        "one-byte-short ALPN marker must be skipped entirely, not partially embedded"
     );
 }
 

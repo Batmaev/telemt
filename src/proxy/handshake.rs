@@ -241,7 +241,26 @@ fn auth_probe_record_failure_with_state(
             rounds += 1;
             if rounds > 8 {
                 auth_probe_note_saturation(now);
-                return;
+                let mut eviction_candidate: Option<(IpAddr, u32, Instant)> = None;
+                for entry in state.iter().take(AUTH_PROBE_PRUNE_SCAN_LIMIT) {
+                    let key = *entry.key();
+                    let fail_streak = entry.value().fail_streak;
+                    let last_seen = entry.value().last_seen;
+                    match eviction_candidate {
+                        Some((_, current_fail, current_seen))
+                            if fail_streak > current_fail
+                                || (fail_streak == current_fail && last_seen >= current_seen) =>
+                        {
+                        }
+                        _ => eviction_candidate = Some((key, fail_streak, last_seen)),
+                    }
+                }
+
+                let Some((evict_key, _, _)) = eviction_candidate else {
+                    return;
+                };
+                state.remove(&evict_key);
+                break;
             }
 
             let mut stale_keys = Vec::new();
@@ -518,6 +537,7 @@ pub struct HandshakeSuccess {
     /// Client address
     pub peer: SocketAddr,
     /// Whether TLS was used
+    
     pub is_tls: bool,
 }
 
@@ -716,7 +736,11 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    trace!(peer = %peer, handshake = ?hex::encode(handshake), "MTProto handshake bytes");
+    trace!(
+        peer = %peer,
+        handshake_head = %hex::encode(&handshake[..8]),
+        "MTProto handshake prefix"
+    );
 
     let throttle_now = Instant::now();
     if auth_probe_should_apply_preauth_throttle(peer.ip(), throttle_now) {
@@ -916,6 +940,7 @@ pub fn encrypt_tg_nonce_with_ciphers(nonce: &[u8; HANDSHAKE_LEN]) -> (Vec<u8>, A
 }
 
 /// Encrypt nonce for sending to Telegram (legacy function for compatibility)
+
 pub fn encrypt_tg_nonce(nonce: &[u8; HANDSHAKE_LEN]) -> Vec<u8> {
     let (encrypted, _, _) = encrypt_tg_nonce_with_ciphers(nonce);
     encrypted

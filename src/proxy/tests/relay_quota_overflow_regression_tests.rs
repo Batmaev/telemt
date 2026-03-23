@@ -19,13 +19,18 @@ async fn read_available<R: AsyncRead + Unpin>(reader: &mut R, budget_ms: u64) ->
     total
 }
 
+fn preload_user_quota(stats: &Stats, user: &str, bytes: u64) {
+    let user_stats = stats.get_or_create_user_stats_handle(user);
+    stats.quota_charge_post_write(user_stats.as_ref(), bytes);
+}
+
 #[tokio::test]
 async fn regression_client_chunk_larger_than_remaining_quota_does_not_overshoot_accounting() {
     let stats = Arc::new(Stats::new());
     let user = "quota-overflow-regression-client-chunk";
 
     // Leave only 1 byte remaining under quota.
-    stats.add_user_octets_from(user, 9);
+    preload_user_quota(stats.as_ref(), user, 9);
 
     let (mut client_peer, relay_client) = duplex(2048);
     let (relay_server, mut server_peer) = duplex(2048);
@@ -68,7 +73,7 @@ async fn regression_client_chunk_larger_than_remaining_quota_does_not_overshoot_
         Err(ProxyError::DataQuotaExceeded { .. })
     ));
     assert!(
-        stats.get_user_total_octets(user) <= 10,
+        stats.get_user_quota_used(user) <= 10,
         "accounted bytes must never exceed quota after overflowing chunk"
     );
 }
@@ -79,7 +84,7 @@ async fn regression_client_exact_remaining_quota_forwards_once_then_hard_cuts_of
     let user = "quota-overflow-regression-boundary";
 
     // Leave exactly 4 bytes remaining.
-    stats.add_user_octets_from(user, 6);
+    preload_user_quota(stats.as_ref(), user, 6);
 
     let (mut client_peer, relay_client) = duplex(2048);
     let (relay_server, mut server_peer) = duplex(2048);
@@ -131,7 +136,7 @@ async fn regression_client_exact_remaining_quota_forwards_once_then_hard_cuts_of
         relay_result,
         Err(ProxyError::DataQuotaExceeded { .. })
     ));
-    assert!(stats.get_user_total_octets(user) <= 10);
+    assert!(stats.get_user_quota_used(user) <= 10);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -201,7 +206,7 @@ async fn stress_parallel_relays_same_user_quota_overflow_never_exceeds_cap() {
         "aggregate forwarded bytes across relays must stay within global user quota"
     );
     assert!(
-        stats.get_user_total_octets(user) <= quota,
+        stats.get_user_quota_used(user) <= quota,
         "global accounted bytes must stay within quota under overflow stress"
     );
 }

@@ -29,6 +29,11 @@ async fn read_available<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, budget:
     total
 }
 
+fn preload_user_quota(stats: &Stats, user: &str, bytes: u64) {
+    let user_stats = stats.get_or_create_user_stats_handle(user);
+    stats.quota_charge_post_write(user_stats.as_ref(), bytes);
+}
+
 #[tokio::test]
 async fn positive_quota_path_forwards_both_directions_within_limit() {
     let stats = Arc::new(Stats::new());
@@ -63,14 +68,14 @@ async fn positive_quota_path_forwards_both_directions_within_limit() {
 
     let relay_result = timeout(Duration::from_secs(2), relay).await.unwrap().unwrap();
     assert!(relay_result.is_ok());
-    assert!(stats.get_user_total_octets(user) <= 16);
+    assert!(stats.get_user_quota_used(user) <= 16);
 }
 
 #[tokio::test]
 async fn negative_preloaded_quota_forbids_any_forwarding() {
     let stats = Arc::new(Stats::new());
     let user = "quota-extended-negative-user";
-    stats.add_user_octets_from(user, 8);
+    preload_user_quota(stats.as_ref(), user, 8);
 
     let (mut client_peer, relay_client) = duplex(1024);
     let (relay_server, mut server_peer) = duplex(1024);
@@ -98,7 +103,7 @@ async fn negative_preloaded_quota_forbids_any_forwarding() {
 
     let relay_result = timeout(Duration::from_secs(2), relay).await.unwrap().unwrap();
     assert!(matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. })));
-    assert!(stats.get_user_total_octets(user) <= 8);
+    assert!(stats.get_user_quota_used(user) <= 8);
 }
 
 #[tokio::test]
@@ -189,7 +194,7 @@ async fn adversarial_blackhat_alternating_jitter_does_not_overshoot_quota() {
     let relay_result = timeout(Duration::from_secs(3), relay).await.unwrap().unwrap();
     assert!(matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. })));
     assert!(total_forwarded <= quota as usize);
-    assert!(stats.get_user_total_octets(user) <= quota);
+    assert!(stats.get_user_quota_used(user) <= quota);
 }
 
 #[tokio::test]
@@ -252,7 +257,7 @@ async fn light_fuzz_random_quota_schedule_preserves_quota_invariants() {
         let relay_result = timeout(Duration::from_secs(2), relay).await.unwrap().unwrap();
         assert!(relay_result.is_ok() || matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. })));
         assert!(total_forwarded <= quota as usize);
-        assert!(stats.get_user_total_octets(&user) <= quota);
+        assert!(stats.get_user_quota_used(&user) <= quota);
     }
 }
 
@@ -327,6 +332,6 @@ async fn stress_parallel_relays_for_one_user_obey_global_quota() {
         delivered += task.await.unwrap();
     }
 
-    assert!(stats.get_user_total_octets(&user) <= quota);
+    assert!(stats.get_user_quota_used(&user) <= quota);
     assert!(delivered <= quota as usize);
 }

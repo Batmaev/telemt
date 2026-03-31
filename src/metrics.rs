@@ -295,6 +295,27 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
 
     let _ = writeln!(
         out,
+        "# HELP telemt_buffer_pool_buffers_total Snapshot of pooled and allocated buffers"
+    );
+    let _ = writeln!(out, "# TYPE telemt_buffer_pool_buffers_total gauge");
+    let _ = writeln!(
+        out,
+        "telemt_buffer_pool_buffers_total{{kind=\"pooled\"}} {}",
+        stats.get_buffer_pool_pooled_gauge()
+    );
+    let _ = writeln!(
+        out,
+        "telemt_buffer_pool_buffers_total{{kind=\"allocated\"}} {}",
+        stats.get_buffer_pool_allocated_gauge()
+    );
+    let _ = writeln!(
+        out,
+        "telemt_buffer_pool_buffers_total{{kind=\"in_use\"}} {}",
+        stats.get_buffer_pool_in_use_gauge()
+    );
+
+    let _ = writeln!(
+        out,
         "# HELP telemt_connections_total Total accepted connections"
     );
     let _ = writeln!(out, "# TYPE telemt_connections_total counter");
@@ -936,6 +957,39 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
         "telemt_me_route_drop_queue_full_profile_total{{profile=\"high\"}} {}",
         if me_allows_normal {
             stats.get_me_route_drop_queue_full_high()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_c2me_enqueue_events_total ME client->ME enqueue outcomes"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_c2me_enqueue_events_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_c2me_enqueue_events_total{{event=\"full\"}} {}",
+        if me_allows_normal {
+            stats.get_me_c2me_send_full_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_c2me_enqueue_events_total{{event=\"high_water\"}} {}",
+        if me_allows_normal {
+            stats.get_me_c2me_send_high_water_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_c2me_enqueue_events_total{{event=\"timeout\"}} {}",
+        if me_allows_normal {
+            stats.get_me_c2me_send_timeout_total()
         } else {
             0
         }

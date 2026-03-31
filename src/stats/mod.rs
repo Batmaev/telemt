@@ -200,6 +200,14 @@ pub struct Stats {
     me_d2c_flush_duration_us_bucket_1001_5000: AtomicU64,
     me_d2c_flush_duration_us_bucket_5001_20000: AtomicU64,
     me_d2c_flush_duration_us_bucket_gt_20000: AtomicU64,
+    // Buffer pool gauges
+    buffer_pool_pooled_gauge: AtomicU64,
+    buffer_pool_allocated_gauge: AtomicU64,
+    buffer_pool_in_use_gauge: AtomicU64,
+    // C2ME enqueue observability
+    me_c2me_send_full_total: AtomicU64,
+    me_c2me_send_high_water_total: AtomicU64,
+    me_c2me_send_timeout_total: AtomicU64,
     me_d2c_batch_timeout_armed_total: AtomicU64,
     me_d2c_batch_timeout_fired_total: AtomicU64,
     me_writer_pick_sorted_rr_success_try_total: AtomicU64,
@@ -1414,6 +1422,38 @@ impl Stats {
                 .store(value, Ordering::Relaxed);
         }
     }
+
+    pub fn set_buffer_pool_gauges(&self, pooled: usize, allocated: usize, in_use: usize) {
+        if self.telemetry_me_allows_normal() {
+            self.buffer_pool_pooled_gauge
+                .store(pooled as u64, Ordering::Relaxed);
+            self.buffer_pool_allocated_gauge
+                .store(allocated as u64, Ordering::Relaxed);
+            self.buffer_pool_in_use_gauge
+                .store(in_use as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_me_c2me_send_full_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_c2me_send_full_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_me_c2me_send_high_water_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_c2me_send_high_water_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_me_c2me_send_timeout_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_c2me_send_timeout_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn increment_me_floor_cap_block_total(&self) {
         if self.telemetry_me_allows_normal() {
             self.me_floor_cap_block_total
@@ -1778,6 +1818,32 @@ impl Stats {
     }
     pub fn get_me_d2c_flush_duration_us_bucket_gt_20000(&self) -> u64 {
         self.me_d2c_flush_duration_us_bucket_gt_20000
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn get_buffer_pool_pooled_gauge(&self) -> u64 {
+        self.buffer_pool_pooled_gauge.load(Ordering::Relaxed)
+    }
+
+    pub fn get_buffer_pool_allocated_gauge(&self) -> u64 {
+        self.buffer_pool_allocated_gauge.load(Ordering::Relaxed)
+    }
+
+    pub fn get_buffer_pool_in_use_gauge(&self) -> u64 {
+        self.buffer_pool_in_use_gauge.load(Ordering::Relaxed)
+    }
+
+    pub fn get_me_c2me_send_full_total(&self) -> u64 {
+        self.me_c2me_send_full_total.load(Ordering::Relaxed)
+    }
+
+    pub fn get_me_c2me_send_high_water_total(&self) -> u64 {
+        self.me_c2me_send_high_water_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn get_me_c2me_send_timeout_total(&self) -> u64 {
+        self.me_c2me_send_timeout_total
             .load(Ordering::Relaxed)
     }
     pub fn get_me_d2c_batch_timeout_armed_total(&self) -> u64 {

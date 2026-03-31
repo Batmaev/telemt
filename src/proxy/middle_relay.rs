@@ -645,11 +645,14 @@ async fn enqueue_c2me_command(
     tx: &mpsc::Sender<C2MeCommand>,
     cmd: C2MeCommand,
     send_timeout: Option<Duration>,
+    stats: &Stats,
 ) -> std::result::Result<(), mpsc::error::SendError<C2MeCommand>> {
     match tx.try_send(cmd) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Closed(cmd)) => Err(mpsc::error::SendError(cmd)),
         Err(mpsc::error::TrySendError::Full(cmd)) => {
+            stats.increment_me_c2me_send_full_total();
+            stats.increment_me_c2me_send_high_water_total();
             note_relay_pressure_event();
             // Cooperative yield reduces burst catch-up when the per-conn queue is near saturation.
             if tx.capacity() <= C2ME_SOFT_PRESSURE_MIN_FREE_SLOTS {
@@ -658,7 +661,10 @@ async fn enqueue_c2me_command(
             let reserve_result = match send_timeout {
                 Some(send_timeout) => match timeout(send_timeout, tx.reserve()).await {
                     Ok(result) => result,
-                    Err(_) => return Err(mpsc::error::SendError(cmd)),
+                    Err(_) => {
+                        stats.increment_me_c2me_send_timeout_total();
+                        return Err(mpsc::error::SendError(cmd));
+                    }
                 },
                 None => tx.reserve().await,
             };
@@ -667,7 +673,10 @@ async fn enqueue_c2me_command(
                     permit.send(cmd);
                     Ok(())
                 }
-                Err(_) => Err(mpsc::error::SendError(cmd)),
+                Err(_) => {
+                    stats.increment_me_c2me_send_timeout_total();
+                    Err(mpsc::error::SendError(cmd))
+                }
             }
         }
     }
@@ -1190,7 +1199,9 @@ where
                 user = %user,
                 "Middle-relay pressure eviction for idle-candidate session"
             );
-            let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close, c2me_send_timeout).await;
+            let _ =
+                enqueue_c2me_command(&c2me_tx, C2MeCommand::Close, c2me_send_timeout, stats.as_ref())
+                    .await;
             main_result = Err(ProxyError::Proxy(
                 "middle-relay session evicted under pressure (idle-candidate)".to_string(),
             ));
@@ -1209,7 +1220,9 @@ where
                 "Cutover affected middle session, closing client connection"
             );
             tokio::time::sleep(delay).await;
-            let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close, c2me_send_timeout).await;
+            let _ =
+                enqueue_c2me_command(&c2me_tx, C2MeCommand::Close, c2me_send_timeout, stats.as_ref())
+                    .await;
             main_result = Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
             break;
         }
@@ -1271,6 +1284,7 @@ where
                             &c2me_tx,
                             C2MeCommand::Data { payload, flags },
                             c2me_send_timeout,
+                            stats.as_ref(),
                         )
                         .await
                             .is_err()
@@ -1282,9 +1296,13 @@ where
                     Ok(None) => {
                         debug!(conn_id, "Client EOF");
                         client_closed = true;
-                        let _ =
-                            enqueue_c2me_command(&c2me_tx, C2MeCommand::Close, c2me_send_timeout)
-                                .await;
+                        let _ = enqueue_c2me_command(
+                            &c2me_tx,
+                            C2MeCommand::Close,
+                            c2me_send_timeout,
+                            stats.as_ref(),
+                        )
+                        .await;
                         break;
                     }
                     Err(e) => {
@@ -1336,6 +1354,12 @@ where
     clear_relay_idle_candidate(conn_id);
     me_pool.registry().unregister(conn_id).await;
     buffer_pool.trim_to(buffer_pool.max_buffers().min(64));
+    let pool_snapshot = buffer_pool.stats();
+    stats.set_buffer_pool_gauges(
+        pool_snapshot.pooled,
+        pool_snapshot.allocated,
+        pool_snapshot.allocated.saturating_sub(pool_snapshot.pooled),
+    );
     result
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::stats::Stats;
 use crate::stream::BufferPool;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -119,6 +120,7 @@ async fn c2me_channel_full_path_yields_then_sends() {
     .expect("priming queue with one frame must succeed");
 
     let tx2 = tx.clone();
+    let stats = Stats::default();
     let producer = tokio::spawn(async move {
         enqueue_c2me_command(
             &tx2,
@@ -127,6 +129,7 @@ async fn c2me_channel_full_path_yields_then_sends() {
                 flags: 2,
             },
             None,
+            &stats,
         )
         .await
     });

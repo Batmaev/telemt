@@ -323,6 +323,12 @@ where
     }
 
     buffer_pool_trim.trim_to(buffer_pool_trim.max_buffers().min(64));
+    let pool_snapshot = buffer_pool_trim.stats();
+    stats.set_buffer_pool_gauges(
+        pool_snapshot.pooled,
+        pool_snapshot.allocated,
+        pool_snapshot.allocated.saturating_sub(pool_snapshot.pooled),
+    );
     relay_result
 }
 

@@ -8,6 +8,7 @@
 > - in **Telegram Desktop** starting from version **6.7.2**
 > - in **Telegram Android Client** starting from version **12.6.4**
 > - **release for iOS is "work in progress"**
+>
 > To work with EE-MTProxy, please update your client!
 
 <p align="center">

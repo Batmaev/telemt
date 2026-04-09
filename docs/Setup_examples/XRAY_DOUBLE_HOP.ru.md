@@ -2,16 +2,16 @@
 
 ## Концепция
 - **Сервер A** (_РФ_):\
-  Точка входа, принимает трафик пользователей Telegram-прокси через **HAProxy** (порт `443\tcp`)\
-  и отправляет его через локальный клиент **Xray** (порт `10443\tcp`) на Сервер **B**.\
-  Порт для клиентов HAProxy — `443\tcp`
+  Точка входа, принимает трафик пользователей Telegram-прокси напрямую через **Xray** (порт `443\tcp`)\
+  и отправляет его в туннель на Сервер **B**.\
+  Порт для клиентов Telegram — `443\tcp`
 - **Сервер B** (_условно Нидерланды_):\
   Точка выхода, на нем работает **Xray-сервер** (принимает подключения точки входа) и **telemt**.\
   На сервере должен быть неограниченный доступ до серверов Telegram.\
   Порт для VLESS/REALITY (вход) — `443\tcp`\
   Внутренний порт telemt (куда пробрасывается трафик) — `8443\tcp`
 
-Туннель работает по протоколу VLESS-XTLS-Reality (или VLESS/xhttp/reality). Оригинальный IP-адрес клиента сохраняется благодаря протоколу PROXYv2, который HAProxy добавляет перед отправкой в Xray, и который прозрачно доходит до telemt.
+Туннель работает по протоколу VLESS-XTLS-Reality (или VLESS/xhttp/reality). Оригинальный IP-адрес клиента сохраняется благодаря протоколу PROXYv2, который Xray на Сервере А добавляет через локальный loopback перед упаковкой в туннель, благодаря чему прозрачно доходит до telemt.
 
 ---
 
@@ -136,7 +136,7 @@ sudo systemctl enable xray
 ### Конфигурация Сервера A (_РФ_):
 
 Аналогично, редактируем `/usr/local/etc/xray/config.json`.
-Здесь Xray выступает клиентом: он локально принимает трафик на порту `10443\tcp` (от HAProxy) и упаковывает его в Reality до Сервера B, прося тот доставить данные на *свой локальный* порт `127.0.0.1:8443` (именно там будет слушать telemt).
+Здесь Xray выступает публичной точкой: он принимает трафик на внешний порт `443\tcp`, пропускает через локальный loopback (порт `10444`) для добавления PROXYv2-заголовка, и упаковывает в Reality до Сервера B, прося тот доставить данные на *свой локальный* порт `127.0.0.1:8443` (именно там будет слушать telemt).
 
 ```bash
 nano /usr/local/etc/xray/config.json
@@ -151,7 +151,19 @@ nano /usr/local/etc/xray/config.json
   },
   "inbounds": [
     {
-      "port": 10443,
+      "tag": "public-in",
+      "port": 443,
+      "listen": "0.0.0.0",
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 10444,
+        "network": "tcp"
+      }
+    },
+    {
+      "tag": "tunnel-in",
+      "port": 10444,
       "listen": "127.0.0.1",
       "protocol": "dokodemo-door",
       "settings": {
@@ -162,6 +174,13 @@ nano /usr/local/etc/xray/config.json
     }
   ],
   "outbounds": [
+    {
+      "tag": "local-injector",
+      "protocol": "freedom",
+      "settings": {
+        "proxyProtocol": 2
+      }
+    },
     {
       "tag": "vless-out",
       "protocol": "vless",
@@ -194,10 +213,30 @@ nano /usr/local/etc/xray/config.json
         }
       }
     }
-  ]
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["public-in"],
+        "outboundTag": "local-injector"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["tunnel-in"],
+        "outboundTag": "vless-out"
+      }
+    ]
+  }
 }
 ```
 *Замените `<PUBLIC_IP_SERVER_B>` на внешний IP-адрес Сервера B.*
+
+Открываем порт на фаерволе для клиентов:
+```bash
+sudo ufw allow 443/tcp
+```
 
 Перезапускаем Xray:
 ```bash
@@ -207,80 +246,7 @@ sudo systemctl enable xray
 
 ---
 
-## Шаг 2. Настройка HAProxy на Сервере A (_РФ_)
-
-HAProxy будет висеть на публичном порту `443` Сервера A, принимать подключения от Telegram-клиентов, добавлять заголовок `PROXYv2` (чтобы пробросить реальный IP пользователя) и отправлять в локальный клиент Xray.
-Установка Docker аналогична [инструкции AmneziaWG варианта](./VPS_DOUBLE_HOP.ru.md).
-
-> [!WARNING]
-> Если запускаете не под `root` или возникают проблемы с правами на `443` порт:
-> ```bash
-> echo "net.ipv4.ip_unprivileged_port_start = 0" | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
-> ```
-
-#### Создаем папку для HAProxy:
-```bash
-mkdir -p /opt/docker-compose/haproxy && cd $_
-```
-
-#### Создаем файл `docker-compose.yaml`
-```yaml
-services:
-  haproxy:
-    image: haproxy:latest
-    container_name: haproxy
-    restart: unless-stopped
-    # user: "root"
-    network_mode: "host"
-    volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "1m"
-        max-file: "1"
-```
-
-#### Создаем файл конфигурации `haproxy.cfg`
-```haproxy
-global
-    log stdout format raw local0
-    maxconn 10000
-
-defaults
-    log     global
-    mode    tcp
-    option  tcplog
-    option  clitcpka
-    option  srvtcpka
-    timeout connect 5s
-    timeout client  2h
-    timeout server  2h
-    timeout check   5s
-
-frontend tcp_in_443
-    bind *:443
-    maxconn 8000
-    option tcp-smart-accept
-    default_backend telemt_nodes
-
-backend telemt_nodes
-    option tcp-smart-connect
-    server telemt_core 127.0.0.1:10443 check inter 5s rise 2 fall 3 maxconn 250000 send-proxy-v2
-
-```
->[!WARNING]
->**Файл должен заканчиваться пустой строкой, иначе HAProxy не запустится!**
-
-#### Разрешаем порт `443\tcp` в фаерволе и запускаем контейнер
-```bash
-sudo ufw allow 443/tcp
-docker compose up -d
-```
-
----
-
-## Шаг 3. Установка и настройка telemt на Сервере B (_Нидерланды_)
+## Шаг 2. Установка и настройка telemt на Сервере B (_Нидерланды_)
 
 Установка telemt описана [в основной инструкции](../QUICK_START_GUIDE.ru.md).
 Отличие в том, что telemt должен слушать *внутренний* порт (так как 443 занят Xray-сервером), а также ожидать `PROXY` протокол из Xray туннеля.
@@ -299,7 +265,7 @@ public_port = 443
 ```
 
 - `port = 8443` и `listen_addr_ipv4 = "127.0.0.1"` означают, что telemt принимает подключения только изнутри (приходящие от локального Xray-процесса).
-- `proxy_protocol = true` заставляет telemt парсить PROXYv2-заголовок (который добавил HAProxy на Сервере A и протащил Xray), восстанавливая IP-адрес конечного пользователя (РФ).
+- `proxy_protocol = true` заставляет telemt парсить PROXYv2-заголовок (который добавил Xray на Сервере A через loopback), восстанавливая IP-адрес конечного пользователя (РФ).
 - В `public_host` укажите публичный IP-адрес или домен Сервера A, чтобы ссылки на подключение генерировались корректно.
 
 Перезапустите `telemt`, и клиенты смогут подключаться по выданным ссылкам.

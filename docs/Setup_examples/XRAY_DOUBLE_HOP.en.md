@@ -2,16 +2,16 @@
 
 ## Concept
 - **Server A** (_e.g., RU_):\
-  Entry point, accepts Telegram proxy user traffic via **HAProxy** (port `443\tcp`)\
-  and sends it through the local **Xray** client (port `10443\tcp`) to Server **B**.\
-  Public port for HAProxy clients — `443\tcp`
+  Entry point, accepts Telegram proxy user traffic via **Xray** (port `443\tcp`)\
+  and sends it through the tunnel to Server **B**.\
+  Public port for Telegram clients — `443\tcp`
 - **Server B** (_e.g., NL_):\
   Exit point, runs the **Xray server** (to terminate the tunnel entry point) and **telemt**.\
   The server must have unrestricted access to Telegram Data Centers.\
   Public port for VLESS/REALITY (incoming) — `443\tcp`\
   Internal telemt port (where decrypted Xray traffic ends up) — `8443\tcp`
 
-The tunnel works over the `VLESS-XTLS-Reality` (or `VLESS/xhttp/reality`) protocol. The original client IP address is preserved thanks to the PROXYv2 protocol, which HAProxy prepends before passing to Xray, and which transparently reaches telemt.
+The tunnel works over the `VLESS-XTLS-Reality` (or `VLESS/xhttp/reality`) protocol. The original client IP address is preserved thanks to the PROXYv2 protocol, which Xray on Server A dynamically injects via a local loopback before wrapping the traffic into Reality, transparently delivering the real IPs to telemt on Server B.
 
 ---
 
@@ -136,7 +136,7 @@ sudo systemctl enable xray
 ### Configuration for Server A (_RU_):
 
 Similarly, edit `/usr/local/etc/xray/config.json`.
-Here Xray acts as a local client: it listens on `10443\tcp` (for traffic from HAProxy), encapsulates it via Reality to Server B, and instructs Server B to deliver it to its *local* `127.0.0.1:8443` port (where telemt will listen).
+Here Xray acts as the public entry point: it listens on `443\tcp`, uses a local loopback (via internal port `10444`) to prepend the `PROXYv2` header, and encapsulates the payload via Reality to Server B, instructing Server B to deliver it to its *local* `127.0.0.1:8443` port (where telemt will listen).
 
 ```bash
 nano /usr/local/etc/xray/config.json
@@ -151,7 +151,19 @@ File content:
   },
   "inbounds": [
     {
-      "port": 10443,
+      "tag": "public-in",
+      "port": 443,
+      "listen": "0.0.0.0",
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 10444,
+        "network": "tcp"
+      }
+    },
+    {
+      "tag": "tunnel-in",
+      "port": 10444,
       "listen": "127.0.0.1",
       "protocol": "dokodemo-door",
       "settings": {
@@ -162,6 +174,13 @@ File content:
     }
   ],
   "outbounds": [
+    {
+      "tag": "local-injector",
+      "protocol": "freedom",
+      "settings": {
+        "proxyProtocol": 2
+      }
+    },
     {
       "tag": "vless-out",
       "protocol": "vless",
@@ -194,10 +213,30 @@ File content:
         }
       }
     }
-  ]
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["public-in"],
+        "outboundTag": "local-injector"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["tunnel-in"],
+        "outboundTag": "vless-out"
+      }
+    ]
+  }
 }
 ```
 *Replace `<PUBLIC_IP_SERVER_B>` with the public IP address of Server B.*
+
+Open the firewall port for clients (if enabled):
+```bash
+sudo ufw allow 443/tcp
+```
 
 Restart and setup Xray to run at boot:
 ```bash
@@ -207,81 +246,7 @@ sudo systemctl enable xray
 
 ---
 
-## Step 2. Setup HAProxy on Server A (_RU_)
-
-HAProxy will run on the public port `443` of Server A, receive incoming connections from Telegram users, attach a `PROXYv2` header (to forward the true user IP) and send the stream to the local Xray client.
-Docker installation is like the [AmneziaWG instructions](./VPS_DOUBLE_HOP.en.md).
-
-> [!WARNING]
-> If you don't run as `root` or have issues with binding to port `443` (`cannot bind socket`), allow unprivileged usage:
-> ```bash
-> echo "net.ipv4.ip_unprivileged_port_start = 0" | sudo tee -a /etc/sysctl.conf && sudo sysctl -p
-> ```
-
-#### Create HAProxy Directory:
-```bash
-mkdir -p /opt/docker-compose/haproxy && cd $_
-```
-
-#### Create `docker-compose.yaml`
-```yaml
-services:
-  haproxy:
-    image: haproxy:latest
-    container_name: haproxy
-    restart: unless-stopped
-    # user: "root"
-    network_mode: "host"
-    volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "1m"
-        max-file: "1"
-```
-
-#### Create HAProxy Config `haproxy.cfg`
-```haproxy
-global
-    log stdout format raw local0
-    maxconn 10000
-
-defaults
-    log     global
-    mode    tcp
-    option  tcplog
-    option  clitcpka
-    option  srvtcpka
-    timeout connect 5s
-    timeout client  2h
-    timeout server  2h
-    timeout check   5s
-
-frontend tcp_in_443
-    bind *:443
-    maxconn 8000
-    option tcp-smart-accept
-    default_backend telemt_nodes
-
-backend telemt_nodes
-    option tcp-smart-connect
-    server telemt_core 127.0.0.1:10443 check inter 5s rise 2 fall 3 maxconn 250000 send-proxy-v2
-
-```
->[!WARNING]
->**The configuration file must end with an empty newline, otherwise HAProxy fails to start!**
-
-#### Start the HAProxy Container
-Allow port `443\tcp` in your firewall and launch Docker compose:
-```bash
-sudo ufw allow 443/tcp
-docker compose up -d
-```
-
----
-
-## Step 3. Install telemt on Server B (_EU_)
+## Step 2. Install telemt on Server B (_EU_)
 
 telemt installation is heavily covered in the [Quick Start Guide](../QUICK_START_GUIDE.en.md).
 By contrast to standard setups, telemt must listen strictly _locally_ (since Xray occupies the public `443` interface) and must expect `PROXYv2` packets.
@@ -301,7 +266,7 @@ public_port = 443
 ```
 
 - Address `127.0.0.1` and `port = 8443` instructs the core proxy router to process connections unpacked locally via Xray-server.
-- `proxy_protocol = true` commands telemt to parse the injected PROXY header (from Server A's HAProxy) and log genuine end-user IPs.
+- `proxy_protocol = true` commands telemt to parse the injected PROXY header (from Server A's Xray local loopback) and log genuine end-user IPs.
 - Under `public_host`, place Server A's public IP address or FQDN to ensure working links are generated for Telegram users.
 
 Restart `telemt`. Your server is now robust against DPI scanners, passing traffic optimally.
